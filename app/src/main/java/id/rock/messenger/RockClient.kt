@@ -147,8 +147,9 @@ class RockClient(
     private var historyLoading = false
 
     init {
-        if (host.isBlank() || host == "127.0.0.1" || host.equals("localhost", true)) {
+        if (host.isBlank() || host == "127.0.0.1" || host == "192.168.222.2" || host.equals("localhost", true)) {
             host = DEFAULT_HOST
+            prefs.edit().putString("host", host).apply()
         }
         if (port !in 1..65535) port = DEFAULT_PORT
         val saved = prefs.getString("x25519", "").orEmpty()
@@ -173,7 +174,8 @@ class RockClient(
     }
 
     fun setEndpoint(nextHost: String, nextPort: Int) {
-        val clean = nextHost.trim().ifBlank { DEFAULT_HOST }
+        val typed = nextHost.trim()
+        val clean = if (typed.isBlank() || typed == "127.0.0.1" || typed.equals("localhost", true)) DEFAULT_HOST else typed
         val p = if (nextPort in 1..65535) nextPort else DEFAULT_PORT
         val changed = clean != host || p != port
         host = clean
@@ -1524,7 +1526,7 @@ class RockClient(
     }
 
     companion object {
-        const val DEFAULT_HOST = "192.168.222.2"
+        const val DEFAULT_HOST = "95.165.30.178"
         const val DEFAULT_PORT = 7410
         private const val PAGE = 50
         private val months = arrayOf(

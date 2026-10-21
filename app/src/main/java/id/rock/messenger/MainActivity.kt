@@ -200,7 +200,7 @@ class MainActivity : AppCompatActivity(), RockClient.Callback {
         column.addView(again)
         authErrorView = label("", 13f, C_DANGER).apply { visibility = View.GONE }
         column.addView(authErrorView)
-        val host = field("192.168.222.2").apply { setText(client.host) }
+        val host = field("95.165.30.178").apply { setText(client.host) }
         val port = field("7410").apply {
             setText(client.port.toString())
             inputType = InputType.TYPE_CLASS_NUMBER
