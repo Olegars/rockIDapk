@@ -48,6 +48,7 @@ class MainActivity : AppCompatActivity(), RockClient.Callback {
     private var dialogEmpty: TextView? = null
     private var chatAdapter: MessageAdapter? = null
     private var chatList: RecyclerView? = null
+    private var callStrip: LinearLayout? = null
     private var peopleAdapter: PersonAdapter? = null
     private var memberAdapter: PersonAdapter? = null
 
@@ -143,6 +144,14 @@ class MainActivity : AppCompatActivity(), RockClient.Callback {
         show(Screen.LOGIN)
     }
 
+    override fun onCall() {
+        if (callStrip == null) {
+            if (client.callIncoming) toast("Входящий звонок")
+            return
+        }
+        refreshCallStrip()
+    }
+
     override fun onBoard(title: String, rows: List<String>) {
         boardTitle = title
         boardLines = rows
@@ -158,6 +167,7 @@ class MainActivity : AppCompatActivity(), RockClient.Callback {
         dialogEmpty = null
         chatAdapter = null
         chatList = null
+        callStrip = null
         peopleAdapter = null
         memberAdapter = null
         content.removeAllViews()
@@ -236,6 +246,7 @@ class MainActivity : AppCompatActivity(), RockClient.Callback {
         val page = column(0)
         content.addView(page, match())
         page.addView(bar("rockID", "Новый") { show(Screen.PEOPLE) })
+        mountCallStrip(page)
         val list = recycler()
         val adapter = DialogAdapter { openChat(it.id) }
         dialogAdapter = adapter
@@ -281,7 +292,16 @@ class MainActivity : AppCompatActivity(), RockClient.Callback {
                 show(Screen.DIALOGS)
             }
         }
+        if (!client.callLive) {
+            header.addView(TextView(this).apply {
+                text = "Звонок"
+                setTextColor(C_ACCENT)
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+                setOnClickListener { ensureMic { client.startCall() } }
+            }, 1)
+        }
         page.addView(header)
+        mountCallStrip(page)
         val list = recycler()
         chatList = list
         val adapter = MessageAdapter({ client.loadOlder() }, { messageMenu(it) })
@@ -398,6 +418,65 @@ class MainActivity : AppCompatActivity(), RockClient.Callback {
 
     private fun send(input: EditText) {
         if (client.sendMessage(input.text.toString())) input.setText("")
+    }
+
+    private fun ensureMic(then: () -> Unit) {
+        if (Build.VERSION.SDK_INT >= 23 &&
+            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), 22)
+            toast("Разрешите микрофон и нажмите ещё раз")
+            return
+        }
+        then()
+    }
+
+    private fun mountCallStrip(page: LinearLayout) {
+        val host = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        callStrip = host
+        page.addView(host, LinearLayout.LayoutParams(matchW(), LinearLayout.LayoutParams.WRAP_CONTENT))
+        refreshCallStrip()
+    }
+
+    private fun refreshCallStrip() {
+        val host = callStrip ?: return
+        host.removeAllViews()
+        val bar = buildCallBar() ?: return
+        host.addView(bar, LinearLayout.LayoutParams(matchW(), LinearLayout.LayoutParams.WRAP_CONTENT))
+    }
+
+    private fun buildCallBar(): View? {
+        if (!client.callIncoming && !client.callLive) return null
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(if (client.callLive) 0xFF1D4E3A.toInt() else 0xFF1E4D7B.toInt())
+            setPadding(dp(12), dp(8), dp(8), dp(8))
+            addView(TextView(this@MainActivity).apply {
+                text = when {
+                    client.callIncoming -> "Входящий звонок"
+                    client.callMuted -> "Звонок · микрофон выключен"
+                    else -> "Звонок"
+                }
+                setTextColor(C_TEXT)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            fun chip(label: String, click: () -> Unit) = addView(TextView(this@MainActivity).apply {
+                text = label
+                setTextColor(C_TEXT)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+                setOnClickListener { click() }
+            })
+            if (client.callIncoming) {
+                chip("Принять") { ensureMic { client.acceptCall() } }
+                chip("Отклонить") { client.declineCall() }
+            } else {
+                chip(if (client.callMuted) "Включить" else "Выключить") { client.toggleCallMute() }
+                chip("Завершить") { client.hangUp() }
+            }
+        }
     }
 
     private fun goBack() {
@@ -601,7 +680,7 @@ class MainActivity : AppCompatActivity(), RockClient.Callback {
         act("Папка") { client.createFolder(extra.text.toString()) }
         act("История 24 ч") { client.postStory(extra.text.toString(), 24, "everybody", true) }
         act("Истории") { client.loadStories() }
-        act("Эфир") { client.startCall() }
+        act("Эфир") { ensureMic { client.startCall() } }
         act("Камера эфира") { client.callState(extra.text.toString().toLongOrNull() ?: 0L, muted = false, video = true, screen = false) }
         act("Экран эфира") { client.callState(extra.text.toString().toLongOrNull() ?: 0L, muted = false, video = false, screen = true) }
         act("Фрагмент эфира") {

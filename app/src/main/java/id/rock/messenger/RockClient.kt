@@ -12,6 +12,7 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.zip.Deflater
@@ -99,6 +100,7 @@ class RockClient(
         fun onNotice(text: String)
         fun onCloudPassword(challenge: String) {}
         fun onBoard(title: String, rows: List<String>) {}
+        fun onCall() {}
     }
 
     private val appContext = context.applicationContext
@@ -106,6 +108,7 @@ class RockClient(
     private val aes = HashMap<Long, ByteArray>()
     private val main = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
+    private val writer = Executors.newSingleThreadExecutor()
     private val watch = Executors.newSingleThreadScheduledExecutor()
     private val running = AtomicBoolean(false)
     private val writeLock = Any()
@@ -128,6 +131,14 @@ class RockClient(
         private set
     var activeDialogId: Long = 0
         private set
+    @Volatile var callLive: Boolean = false
+        private set
+    @Volatile var callIncoming: Boolean = false
+        private set
+    @Volatile var callMuted: Boolean = false
+        private set
+    @Volatile var callId: Long = 0
+        private set
 
     private var token: String = prefs.getString("token", "") ?: ""
     private var compress = false
@@ -145,6 +156,21 @@ class RockClient(
     private val fetchingUsers = HashSet<Long>()
     private var contacts = listOf<Person>()
     private var historyLoading = false
+    private var callDialogId = 0L
+    private var ignoredCall = 0L
+    private var mediaPort = 0
+    @Volatile private var jsonAudio = false
+    @Volatile private var callHasOther = false
+    @Volatile private var ringToken = 0
+    @Volatile private var ringRunning = false
+    @Volatile private var mediaReady = false
+    @Volatile private var micRun = false
+    @Volatile private var micGen = 0
+    private var mediaSocket: Socket? = null
+    private var mediaOut: OutputStream? = null
+    private val mediaLock = Any()
+    private var speaker: android.media.AudioTrack? = null
+    private val speakerLock = Any()
 
     init {
         if (host.isBlank() || host == "127.0.0.1" || host == "192.168.222.2" || host.equals("localhost", true)) {
@@ -168,7 +194,9 @@ class RockClient(
 
     fun stop() {
         running.set(false)
+        closeMedia()
         closeSocket()
+        writer.shutdownNow()
         io.shutdownNow()
         watch.shutdownNow()
     }
@@ -190,13 +218,15 @@ class RockClient(
         val name = username.trim()
         validateUsername(name)?.let { post { callback.onAuthError(it) }; return }
         validatePassword(password)?.let { post { callback.onAuthError(it) }; return }
-        synchronized(writeLock) {
-            authGen++
-            queued = Queued.SignIn
-            qUser = name
-            qPass = password
-            qName = ""
-            writeAuthLocked()
+        awayFromMain {
+            synchronized(writeLock) {
+                authGen++
+                queued = Queued.SignIn
+                qUser = name
+                qPass = password
+                qName = ""
+                writeAuthLocked()
+            }
         }
     }
 
@@ -206,29 +236,33 @@ class RockClient(
         validateUsername(name)?.let { post { callback.onAuthError(it) }; return }
         validatePassword(password)?.let { post { callback.onAuthError(it) }; return }
         validateDisplay(display)?.let { post { callback.onAuthError(it) }; return }
-        synchronized(writeLock) {
-            authGen++
-            queued = Queued.SignUp
-            qUser = name
-            qPass = password
-            qName = display
-            writeAuthLocked()
+        awayFromMain {
+            synchronized(writeLock) {
+                authGen++
+                queued = Queued.SignUp
+                qUser = name
+                qPass = password
+                qName = display
+                writeAuthLocked()
+            }
         }
     }
 
     fun signOut() {
-        synchronized(writeLock) {
-            authGen++
-            queued = Queued.None
-            if (output != null && me != null) {
-                callLocked("auth.signOut", JSONObject()) {}
+        awayFromMain {
+            synchronized(writeLock) {
+                authGen++
+                queued = Queued.None
+                if (output != null && me != null) {
+                    callLocked("auth.signOut", JSONObject()) {}
+                }
+                token = ""
+                prefs.edit().remove("token").apply()
             }
-            token = ""
-            prefs.edit().remove("token").apply()
+            clearChat()
+            me = null
+            post { callback.onSession(null, false) }
         }
-        clearChat()
-        me = null
-        post { callback.onSession(null, false) }
     }
 
     fun forgetSession() {
@@ -530,7 +564,60 @@ class RockClient(
                 val dialogId = data.optLong("dialog_id")
                 if (dialogId == activeDialogId) publishChat(dialogId, false)
             }
-            "call.media" -> playCallAudio(data)
+            "call.media" -> {
+                if (data.optString("kind") == "audio") {
+                    if (!callLive) return
+                    val raw = try {
+                        Base64.decode(data.optString("data"), Base64.DEFAULT)
+                    } catch (_: Exception) {
+                        ByteArray(0)
+                    }
+                    if (raw.size >= 2) playPcm(raw)
+                } else {
+                    playCallAudio(data)
+                }
+            }
+            "call.ring" -> {
+                val id = data.optLong("id")
+                if (!callLive && id != ignoredCall && data.optBoolean("active", true)) {
+                    val fresh = !callIncoming
+                    callId = id
+                    callDialogId = data.optLong("dialog_id")
+                    mediaPort = data.optInt("media_port")
+                    callIncoming = true
+                    notePeers(data)
+                    syncRing()
+                    post {
+                        callback.onCall()
+                        if (fresh) callback.onNotice("Входящий звонок")
+                    }
+                }
+            }
+            "call.ended" -> finishCall(data.optLong("id"))
+            "call.update" -> {
+                val id = data.optLong("id")
+                if (data.has("media_port")) mediaPort = data.optInt("media_port")
+                if (!data.optBoolean("active", true)) {
+                    finishCall(id)
+                } else if (selfInCall(data)) {
+                    if (id == callId || callId == 0L) {
+                        callId = id
+                        callIncoming = false
+                        post { callback.onCall() }
+                    }
+                } else if (!callLive && id != ignoredCall) {
+                    val fresh = !callIncoming
+                    callId = id
+                    callDialogId = data.optLong("dialog_id")
+                    callIncoming = true
+                    post {
+                        callback.onCall()
+                        if (fresh) callback.onNotice("Входящий звонок")
+                    }
+                }
+                notePeers(data)
+                syncRing()
+            }
             "message.edit" -> {
                 val message = messageOf(data)
                 replace(message)
@@ -541,7 +628,6 @@ class RockClient(
             }
             "message.reaction" -> applyReaction(data)
             "screenshot", "story.screenshot" -> post { callback.onNotice("Собеседник сделал скриншот") }
-            "call.update" -> post { callback.onBoard("Эфир", listOf("id ${data.optLong("id")} · участников ${data.optJSONArray("peers")?.length() ?: 0}")) }
             "dialog.new" -> upsert(data)
             "dialog.member" -> loadMembers()
             "presence" -> {
@@ -818,8 +904,12 @@ class RockClient(
         }
     }
 
+    private fun awayFromMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) writer.execute(block) else block()
+    }
+
     private fun call(method: String, params: JSONObject, callback: (JSONObject) -> Unit) {
-        synchronized(writeLock) { callLocked(method, params, callback) }
+        awayFromMain { synchronized(writeLock) { callLocked(method, params, callback) } }
     }
 
     private fun callLocked(method: String, params: JSONObject, callback: (JSONObject) -> Unit) {
@@ -842,9 +932,16 @@ class RockClient(
             }
         }
         val head = ByteBuffer.allocate(4).putInt(size).array()
-        out.write(head)
-        out.write(body)
-        out.flush()
+        try {
+            out.write(head)
+            out.write(body)
+            out.flush()
+        } catch (_: Exception) {
+            pending.remove(id)
+            output = null
+            val err = JSONObject().put("ok", false).put("error", JSONObject().put("message", "NOT_CONNECTED"))
+            post { callback(err) }
+        }
     }
 
     private fun watchdog() {
@@ -1150,7 +1247,50 @@ class RockClient(
     fun pinSet() = prefs.contains("pin")
     fun checkPin(pin: String) = prefs.getString("pin", "") == sha(pin)
     fun savePreferences(json: String) = rpc("account.setPreferences", JSONObject().put("preferences", json)) { post { callback.onNotice("Оформление сохранено") } }
-    fun startCall() = rpc("calls.start", JSONObject().put("dialog_id", activeDialogId)) { post { callback.onBoard("Эфир", listOf("id ${it.optLong("id")}")) } }
+    fun startCall() {
+        if (callLive) return
+        val dialog = activeDialogId
+        if (dialog <= 0) {
+            post { callback.onNotice("Откройте чат") }
+            return
+        }
+        rpc("calls.start", JSONObject().put("dialog_id", dialog)) { room ->
+            enterCall(room, dialog)
+        }
+    }
+
+    fun acceptCall() {
+        val id = callId
+        if (id <= 0 || callLive) return
+        rpc("calls.join", JSONObject().put("call_id", id)) { room ->
+            enterCall(room, callDialogId)
+        }
+    }
+
+    fun declineCall() {
+        ignoredCall = callId
+        callIncoming = false
+        stopRing()
+        post { callback.onCall() }
+    }
+
+    fun hangUp() {
+        val id = callId
+        ignoredCall = id
+        callLive = false
+        callIncoming = false
+        callMuted = false
+        closeMedia()
+        if (id > 0) rpc("calls.leave", JSONObject().put("call_id", id)) {}
+        post { callback.onCall() }
+    }
+
+    fun toggleCallMute() {
+        if (!callLive) return
+        callMuted = !callMuted
+        rpc("calls.setState", JSONObject().put("call_id", callId).put("muted", callMuted).put("video", false).put("screen", false)) {}
+        post { callback.onCall() }
+    }
     fun callState(callId: Long, muted: Boolean, video: Boolean, screen: Boolean) = rpc("calls.setState", JSONObject().put("call_id", callId).put("muted", muted).put("video", video).put("screen", screen)) {}
     fun leaveCall(callId: Long) = rpc("calls.leave", JSONObject().put("call_id", callId)) {}
     fun recordCall(callId: Long) {
@@ -1430,6 +1570,310 @@ class RockClient(
         }
     }
 
+    private fun selfInCall(data: JSONObject): Boolean {
+        val peers = data.optJSONArray("peers") ?: return false
+        val meId = me?.id ?: return false
+        for (i in 0 until peers.length()) {
+            if (peers.getJSONObject(i).optLong("user_id") == meId) return true
+        }
+        return false
+    }
+
+    private fun enterCall(room: JSONObject, dialog: Long) {
+        callId = room.optLong("id")
+        callDialogId = room.optLong("dialog_id", dialog)
+        mediaPort = room.optInt("media_port")
+        ignoredCall = 0
+        callIncoming = false
+        callMuted = false
+        callLive = room.optBoolean("active", true)
+        notePeers(room)
+        if (callLive) {
+            if (mediaPort > 0) openMedia(callId, mediaPort) else startJsonAudio()
+        }
+        syncRing()
+        post { callback.onCall() }
+    }
+
+    private fun startJsonAudio() {
+        closeMedia()
+        jsonAudio = true
+        mediaReady = true
+        startCallMic()
+    }
+
+    private fun finishCall(id: Long) {
+        if (callId != 0L && id != 0L && id != callId) return
+        callLive = false
+        callIncoming = false
+        ignoredCall = 0
+        closeMedia()
+        post { callback.onCall() }
+    }
+
+    private fun openMedia(id: Long, port: Int) {
+        closeMedia()
+        if (port <= 0) {
+            post { callback.onNotice("Сервер без звука") }
+            return
+        }
+        Thread {
+            var socket: Socket? = null
+            try {
+                socket = Socket()
+                socket.tcpNoDelay = true
+                socket.connect(InetSocketAddress(host, port), 8000)
+                val out = socket.getOutputStream()
+                synchronized(mediaLock) {
+                    mediaSocket = socket
+                    mediaOut = out
+                }
+                val tokenBytes = token.toByteArray(Charsets.UTF_8)
+                if (tokenBytes.isEmpty() || tokenBytes.size > 128) {
+                    post { callback.onNotice("Нет сессии для звонка") }
+                    closeMedia()
+                    return@Thread
+                }
+                val hello = ByteBuffer.allocate(1 + 4 + 2 + tokenBytes.size + 8).order(ByteOrder.BIG_ENDIAN)
+                hello.put(1)
+                hello.putInt(2 + tokenBytes.size + 8)
+                hello.putShort(tokenBytes.size.toShort())
+                hello.put(tokenBytes)
+                hello.putLong(id)
+                out.write(hello.array())
+                out.flush()
+                readMedia(socket.getInputStream())
+            } catch (_: Exception) {
+                val current = synchronized(mediaLock) { mediaSocket }
+                if (callLive && (current == null || current == socket)) post { callback.onNotice("Нет звука звонка") }
+            } finally {
+                mediaReady = false
+                try { socket?.close() } catch (_: Exception) {}
+            }
+        }.apply { isDaemon = true; name = "rock-call"; start() }
+    }
+
+    private fun readMedia(input: InputStream) {
+        val pending = ByteArrayOutputStream()
+        val tmp = ByteArray(8192)
+        while (true) {
+            val n = input.read(tmp)
+            if (n < 0) break
+            pending.write(tmp, 0, n)
+            val all = pending.toByteArray()
+            var i = 0
+            while (all.size - i >= 5) {
+                val len = ((all[i + 1].toInt() and 0xff) shl 24) or
+                    ((all[i + 2].toInt() and 0xff) shl 16) or
+                    ((all[i + 3].toInt() and 0xff) shl 8) or
+                    (all[i + 4].toInt() and 0xff)
+                if (len > 8192) return
+                if (all.size - i < 5 + len) break
+                val op = all[i].toInt() and 0xff
+                val payload = all.copyOfRange(i + 5, i + 5 + len)
+                i += 5 + len
+                when (op) {
+                    1 -> {
+                        mediaReady = true
+                        startCallMic()
+                    }
+                    255 -> {
+                        post { callback.onNotice("Звонок не принял звук") }
+                        return
+                    }
+                    2 -> if (payload.size >= 20) playPcm(payload.copyOfRange(20, payload.size))
+                }
+            }
+            pending.reset()
+            if (i < all.size) pending.write(all, i, all.size - i)
+        }
+    }
+
+    private fun startCallMic() {
+        val gen = ++micGen
+        micRun = true
+        Thread {
+            var rec: android.media.AudioRecord? = null
+            try {
+                val rate = 16000
+                val min = android.media.AudioRecord.getMinBufferSize(
+                    rate,
+                    android.media.AudioFormat.CHANNEL_IN_MONO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT,
+                )
+                rec = android.media.AudioRecord(
+                    android.media.MediaRecorder.AudioSource.MIC,
+                    rate,
+                    android.media.AudioFormat.CHANNEL_IN_MONO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT,
+                    min.coerceAtLeast(4096),
+                )
+                rec.startRecording()
+                val frame = ByteArray(1280)
+                while (micRun && gen == micGen) {
+                    var filled = 0
+                    while (micRun && gen == micGen && filled < frame.size) {
+                        val n = rec.read(frame, filled, frame.size - filled)
+                        if (n <= 0) break
+                        filled += n
+                    }
+                    if (!micRun || filled < 2 || callMuted || !mediaReady) continue
+                    val even = filled - (filled % 2)
+                    val body = if (even == frame.size) frame else frame.copyOf(even)
+                    if (jsonAudio) {
+                        val params = JSONObject()
+                            .put("call_id", callId)
+                            .put("kind", "audio")
+                            .put("data", Base64.encodeToString(body, Base64.NO_WRAP))
+                        call("calls.media", params) { response ->
+                            if (response.optBoolean("ok") || !jsonAudio) return@call
+                            if (errorCode(response) != "USE_MEDIA_SOCKET") return@call
+                            jsonAudio = false
+                            mediaReady = false
+                            post { callback.onNotice("Сервер ждёт звук на порту 7412, а он закрыт") }
+                        }
+                        continue
+                    }
+                    val packet = ByteBuffer.allocate(5 + body.size).order(ByteOrder.BIG_ENDIAN)
+                    packet.put(2)
+                    packet.putInt(body.size)
+                    packet.put(body)
+                    synchronized(mediaLock) {
+                        mediaOut?.write(packet.array())
+                        mediaOut?.flush()
+                    }
+                }
+            } catch (_: Exception) {
+                if (callLive) post { callback.onNotice("Нет доступа к микрофону") }
+            } finally {
+                try { rec?.stop() } catch (_: Exception) {}
+                try { rec?.release() } catch (_: Exception) {}
+            }
+        }.apply { isDaemon = true; name = "rock-call-mic"; start() }
+    }
+
+    private fun notePeers(data: JSONObject) {
+        val peers = data.optJSONArray("peers") ?: return
+        val meId = me?.id ?: 0L
+        var other = false
+        for (i in 0 until peers.length()) {
+            val id = peers.getJSONObject(i).optLong("user_id")
+            if (id != 0L && id != meId) other = true
+        }
+        callHasOther = other
+    }
+
+    private fun syncRing() {
+        val need = callIncoming || (callLive && !callHasOther)
+        if (!need) {
+            stopRing()
+            return
+        }
+        if (ringRunning) return
+        val token = ++ringToken
+        ringRunning = true
+        Thread {
+            var track: android.media.AudioTrack? = null
+            try {
+                val rate = 16000
+                val min = android.media.AudioTrack.getMinBufferSize(
+                    rate,
+                    android.media.AudioFormat.CHANNEL_OUT_MONO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT,
+                )
+                track = android.media.AudioTrack(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    rate,
+                    android.media.AudioFormat.CHANNEL_OUT_MONO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT,
+                    min.coerceAtLeast(8192),
+                    android.media.AudioTrack.MODE_STREAM,
+                )
+                track.play()
+                val frame = ShortArray(640)
+                var sample = 0L
+                while (token == ringToken && (callIncoming || (callLive && !callHasOther))) {
+                    val incoming = callIncoming
+                    for (i in frame.indices) {
+                        val t = sample + i
+                        val cycle = if (incoming) 48000L else 80000L
+                        val pos = t % cycle
+                        val on = if (incoming) pos < 6400 || (pos >= 9600 && pos < 16000) else pos < 16000
+                        frame[i] = if (!on) {
+                            0
+                        } else {
+                            (kotlin.math.sin(2.0 * Math.PI * 425.0 * (t % rate) / rate) * 14000.0).toInt().toShort()
+                        }
+                    }
+                    sample += frame.size
+                    track.write(frame, 0, frame.size)
+                }
+            } catch (_: Exception) {
+            } finally {
+                try { track?.stop() } catch (_: Exception) {}
+                try { track?.release() } catch (_: Exception) {}
+                if (token == ringToken) ringRunning = false
+            }
+        }.apply { isDaemon = true; name = "rock-ring"; start() }
+    }
+
+    private fun stopRing() {
+        ringToken++
+        ringRunning = false
+    }
+
+    private fun playPcm(pcm: ByteArray) {
+        if (pcm.size < 2) return
+        val even = pcm.size - (pcm.size % 2)
+        synchronized(speakerLock) {
+            if (speaker == null) {
+                val min = android.media.AudioTrack.getMinBufferSize(
+                    16000,
+                    android.media.AudioFormat.CHANNEL_OUT_MONO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT,
+                )
+                val track = android.media.AudioTrack(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    16000,
+                    android.media.AudioFormat.CHANNEL_OUT_MONO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT,
+                    min.coerceAtLeast(8192),
+                    android.media.AudioTrack.MODE_STREAM,
+                )
+                track.play()
+                speaker = track
+            }
+            speaker?.write(pcm, 0, even)
+        }
+    }
+
+    private fun closeMedia() {
+        micRun = false
+        micGen++
+        jsonAudio = false
+        mediaReady = false
+        stopRing()
+        val out: OutputStream?
+        val socket: Socket?
+        synchronized(mediaLock) {
+            out = mediaOut
+            socket = mediaSocket
+            mediaOut = null
+            mediaSocket = null
+        }
+        try {
+            out?.write(byteArrayOf(3, 0, 0, 0, 0))
+            out?.flush()
+        } catch (_: Exception) {
+        }
+        try { socket?.close() } catch (_: Exception) {}
+        synchronized(speakerLock) {
+            try { speaker?.stop() } catch (_: Exception) {}
+            try { speaker?.release() } catch (_: Exception) {}
+            speaker = null
+        }
+    }
+
     private fun playCallAudio(data: JSONObject) {
         if (data.optString("kind") != "audio") {
             post { callback.onNotice("Фрагмент эфира") }
@@ -1558,6 +2002,7 @@ class RockClient(
             "PREMIUM_REQUIRED" -> "Нужна подписка Premium"
             "NOT_SECRET" -> "Это не секретный чат"
             "NOT_A_CHANNEL" -> "Это не канал"
+            "USE_MEDIA_SOCKET" -> "Звук звонка идёт отдельным соединением"
             "FILE_REQUIRED" -> "Нужен файл"
             "BAD_SIZE" -> "Неверный размер файла"
             "TOO_MANY_PINS" -> "Слишком много закреплённых чатов"

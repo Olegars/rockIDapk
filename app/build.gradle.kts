@@ -11,8 +11,8 @@ android {
         applicationId = "id.rock.messenger"
         minSdk = 24
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.2.1"
+        versionCode = 9
+        versionName = "1.2.6"
     }
 
     buildTypes {
